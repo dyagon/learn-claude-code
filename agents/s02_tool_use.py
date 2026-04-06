@@ -171,11 +171,16 @@ def normalize_messages(messages: list) -> list:
 
 def agent_loop(messages: list):
     while True:
+        print(">>>>>>>>messages")
+        print(messages[-1])
         response = client.messages.create(
             model=MODEL, system=SYSTEM,
             messages=normalize_messages(messages),
             tools=TOOLS, max_tokens=8000,
         )
+        print("<<<<<<<<response")
+        for block in response.content:
+            print(block)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -197,7 +202,10 @@ if __name__ == "__main__":
             query = input("\033[36ms02 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-        if query.strip().lower() in ("q", "exit", ""):
+        if query.strip() == "":
+            print("Please enter a command")
+            continue
+        if query.strip().lower() in ("q", "exit"):
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
