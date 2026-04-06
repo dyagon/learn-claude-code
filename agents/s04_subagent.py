@@ -51,6 +51,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from log import main_logger, sub_logger
+
 load_dotenv(override=True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -167,13 +169,18 @@ CHILD_TOOLS = [
 
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
-def run_subagent(prompt: str) -> str:
+def run_subagent(prompt: str, *, verbose: bool = True) -> str:
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
+    response = None
+    for sub_turn in range(1, 31):  # safety limit
+        if verbose:
+            sub_logger.messages_context(sub_messages, "调用 API 前的消息历史")
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
         )
+        if verbose:
+            sub_logger.llm_response(sub_turn, response)
         sub_messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             break
@@ -182,9 +189,14 @@ def run_subagent(prompt: str) -> str:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                sub_logger.tool_execution(block.name, output, bracket_tag=True)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+        if verbose:
+            sub_logger.tool_results_summary(results)
         sub_messages.append({"role": "user", "content": results})
     # Only the final text returns to the parent -- child context is discarded
+    if response is None:
+        return "(no summary)"
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
@@ -195,12 +207,18 @@ PARENT_TOOLS = CHILD_TOOLS + [
 ]
 
 
-def agent_loop(messages: list):
+def agent_loop(messages: list, *, verbose: bool = True):
+    main_turn = 0
     while True:
+        main_turn += 1
+        if verbose:
+            main_logger.messages_context(messages, "调用 API 前的消息历史")
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=PARENT_TOOLS, max_tokens=8000,
         )
+        if verbose:
+            main_logger.llm_response(main_turn, response)
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -210,13 +228,22 @@ def agent_loop(messages: list):
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
                     prompt = block.input.get("prompt", "")
-                    print(f"> task ({desc}): {prompt[:80]}")
-                    output = run_subagent(prompt)
+                    main_logger.emit(
+                        f"\n> [主 Agent] 委派 task ({desc}): {prompt[:500]}"
+                        + ("…" if len(prompt) > 500 else ""),
+                    )
+                    output = run_subagent(prompt, verbose=verbose)
+                    main_logger.emit(
+                        f"\n[主 Agent] task 返回摘要（前 2000 字）:\n{str(output)[:2000]}"
+                        + ("…" if len(str(output)) > 2000 else ""),
+                    )
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
+                    main_logger.tool_execution(block.name, output, bracket_tag=True)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+        if verbose:
+            main_logger.tool_results_summary(results)
         messages.append({"role": "user", "content": results})
 
 
