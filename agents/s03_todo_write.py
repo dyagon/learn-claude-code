@@ -206,7 +206,7 @@ def agent_loop(messages: list, *, verbose: bool = True):
                         output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                logger.tool_execution(block.name, output)
+                logger.tool_execution(block.name, output, tool_input=block.input)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "todo":
                     used_todo = True

@@ -1,10 +1,27 @@
 #!/usr/bin/env python3
-"""终端 LLM / Agent 交互日志：支持默认输出与主/子 Agent 分色。"""
+"""Agent 调试日志：写入仓库 logs/ 目录，不占用控制台（控制台仅保留正常对话）。
+
+日志文件路径：<仓库根>/logs/<当前执行的 .py 主文件名>.log（追加写入）。
+可通过环境变量 AGENT_LOG_CONSOLE=1 同时镜像到 stderr（带主/子角色颜色）。
+"""
 
 from __future__ import annotations
 
+import atexit
 import json
-from typing import Any
+import os
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Any, TextIO
+
+# 本文件在 agents/ 下，仓库根为其上一级
+_AGENTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _AGENTS_DIR.parent
+_LOGS_DIR = _REPO_ROOT / "logs"
+
+LineClip = tuple[int, int]  # (head_lines, tail_lines)
 
 RESET = "\033[0m"
 COLOR_DEFAULT = ""
@@ -18,9 +35,86 @@ ROLE_DEFAULT = "default"
 ROLE_MAIN = "main"
 ROLE_SUB = "sub"
 
+_log_lock = threading.Lock()
+_log_path: str | None = None
+_log_fp: TextIO | None = None
+
+# 设为 1 / true / yes 时，除写文件外还按原样（含 ANSI）打印到 stderr
+_MIRROR_CONSOLE = os.environ.get("AGENT_LOG_CONSOLE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def get_agent_log_path() -> str:
+    """返回当前会话的日志文件路径（首次写入时打开 logs/<脚本名>.log）。"""
+    _ensure_log_file()
+    assert _log_path is not None
+    return _log_path
+
+
+def _executing_script_log_name() -> str:
+    """取当前 Python 入口脚本主文件名 + .log（如 s04_subagent.log）。"""
+    if not sys.argv:
+        return "python.log"
+    raw = sys.argv[0]
+    path = Path(raw)
+    try:
+        path = path.resolve()
+    except OSError:
+        path = Path(raw)
+    if path.suffix.lower() in (".py", ".pyw") and path.stem:
+        return f"{path.stem}.log"
+    stem = Path(raw).stem
+    if stem and stem not in ("-",):
+        return f"{stem}.log"
+    return "python.log"
+
+
+def _ensure_log_file() -> TextIO:
+    global _log_path, _log_fp
+    with _log_lock:
+        if _log_fp is not None:
+            return _log_fp
+        _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = _LOGS_DIR / _executing_script_log_name()
+        _log_path = str(log_file)
+        _log_fp = open(log_file, "a", encoding="utf-8")
+        _log_fp.write(f"# session start {datetime.now().isoformat(timespec='seconds')}\n")
+        _log_fp.flush()
+        atexit.register(_close_log_file)
+        return _log_fp
+
+
+def _close_log_file() -> None:
+    global _log_fp
+    with _log_lock:
+        if _log_fp is not None:
+            try:
+                _log_fp.write(f"# session end {datetime.now().isoformat(timespec='seconds')}\n")
+                _log_fp.flush()
+                _log_fp.close()
+            except OSError:
+                pass
+            _log_fp = None
+
+
+def clip_text_by_lines(text: str, head: int, tail: int) -> str:
+    """过长时只保留前 head 行与后 tail 行，中间用省略标记。"""
+    if head < 1 or tail < 1:
+        return text
+    lines = text.splitlines()
+    n = len(lines)
+    if n <= head + tail:
+        return text
+    omitted = n - head - tail
+    mid = f"... （省略 {omitted} 行）..."
+    return "\n".join([*lines[:head], mid, *lines[-tail:]])
+
 
 class AgentLogger:
-    """按角色着色打印；role=default 时不加 ANSI 色。"""
+    """日志写入仓库 logs/<脚本名>.log（追加）；不在 stdout 打印（避免干扰对话）。"""
 
     def __init__(self, role: str = ROLE_DEFAULT, *, enabled: bool = True) -> None:
         self.role = role
@@ -43,11 +137,17 @@ class AgentLogger:
     def emit(self, msg: str) -> None:
         if not self.enabled:
             return
-        c = self._color()
-        if c:
-            print(f"{c}{msg}{RESET}")
-        else:
-            print(msg)
+        fp = _ensure_log_file()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = msg.splitlines() if msg else [""]
+        with _log_lock:
+            for line in lines:
+                fp.write(f"{ts} [{self.role}] {line}\n")
+            fp.flush()
+        if _MIRROR_CONSOLE:
+            c = self._color()
+            out = f"{c}{msg}{RESET}" if c else msg
+            print(out, file=sys.stderr)
 
     @staticmethod
     def summarize_message(msg: dict, max_len: int = 400) -> str:
@@ -80,17 +180,43 @@ class AgentLogger:
             return f"{role}: [{'; '.join(parts)}]"
         return f"{role}: {type(content).__name__}"
 
-    def messages_context(self, messages: list, label: str) -> None:
+    def messages_context(
+        self,
+        messages: list,
+        label: str,
+        *,
+        latest_only: bool = False,
+    ) -> None:
         tag = self._tag()
-        if tag:
-            self.emit(f"\n--- [{tag}] {label}（共 {len(messages)} 条）---")
+        n = len(messages)
+        if latest_only:
+            if tag:
+                self.emit(
+                    f"\n--- [{tag}] {label}（共 {n} 条；仅展示最新 1 条）---",
+                )
+            else:
+                self.emit(f"\n--- {label} (共 {n} 条；仅展示最新 1 条) ---")
+            if messages:
+                last = messages[-1]
+                self.emit(f"  [最新 #{n - 1}] {self.summarize_message(last)}")
+            else:
+                self.emit("  (无消息)")
         else:
-            self.emit(f"\n--- {label} (共 {len(messages)} 条) ---")
-        for i, m in enumerate(messages):
-            self.emit(f"  [{i}] {self.summarize_message(m)}")
+            if tag:
+                self.emit(f"\n--- [{tag}] {label}（共 {n} 条）---")
+            else:
+                self.emit(f"\n--- {label} (共 {n} 条) ---")
+            for i, m in enumerate(messages):
+                self.emit(f"  [{i}] {self.summarize_message(m)}")
         self.emit("---")
 
-    def llm_response(self, turn: int, response: Any) -> None:
+    def llm_response(
+        self,
+        turn: int,
+        response: Any,
+        *,
+        output_line_clip: LineClip | None = None,
+    ) -> None:
         tag = self._tag()
         if tag:
             head = f"[{tag} · LLM 回合 {turn}]"
@@ -112,15 +238,30 @@ class AgentLogger:
             if block.type == "text":
                 preview = (block.text or "").strip()
                 if preview:
-                    self.emit("[assistant 文本]\n" + preview)
+                    body = (
+                        clip_text_by_lines(preview, *output_line_clip)
+                        if output_line_clip
+                        else preview
+                    )
+                    self.emit("[assistant 文本]\n" + body)
             elif block.type == "tool_use":
                 self.emit(f"[tool_use] {block.name}")
                 try:
-                    self.emit(json.dumps(block.input, ensure_ascii=False, indent=2))
+                    dumped = json.dumps(block.input, ensure_ascii=False, indent=2)
                 except (TypeError, ValueError):
-                    self.emit(str(block.input))
+                    dumped = str(block.input)
+                self.emit(
+                    clip_text_by_lines(dumped, *output_line_clip)
+                    if output_line_clip
+                    else dumped
+                )
 
-    def tool_results_summary(self, results: list) -> None:
+    def tool_results_summary(
+        self,
+        results: list,
+        *,
+        content_line_clip: LineClip | None = None,
+    ) -> None:
         tag = self._tag()
         if tag:
             self.emit(f"\n--- [{tag}] 本回合返回给模型的 tool_result 摘要 ---")
@@ -128,27 +269,49 @@ class AgentLogger:
             self.emit("\n--- 本回合返回给模型的 tool_result 摘要 ---")
         for r in results:
             if isinstance(r, dict) and r.get("type") == "tool_result":
-                c = str(r.get("content", ""))[:300]
+                raw = str(r.get("content", ""))
+                if content_line_clip:
+                    c = clip_text_by_lines(raw, *content_line_clip)
+                else:
+                    c = raw[:300] + ("…" if len(raw) > 300 else "")
                 tid = str(r.get("tool_use_id", ""))[:12]
-                self.emit(f"  tool_use_id={tid}… content={c!r}…")
+                self.emit(f"  tool_use_id={tid}… content={c!r}")
             elif isinstance(r, dict) and r.get("type") == "text":
-                self.emit(f"  injected: {r.get('text', '')!r}")
+                inj = str(r.get("text", ""))
+                if content_line_clip:
+                    inj = clip_text_by_lines(inj, *content_line_clip)
+                self.emit(f"  injected: {inj!r}")
 
     def tool_execution(
         self,
         tool_name: str,
         output: Any,
         *,
+        tool_input: Any | None = None,
         max_len: int = 2000,
         bracket_tag: bool = False,
+        line_clip: LineClip | None = None,
     ) -> None:
+        """记录本地工具执行：可选参数 tool_input（如 LLM 传入的 JSON）+ 本地返回值。"""
         tag = self._tag()
-        if bracket_tag and tag:
-            self.emit(f"\n> [{tag}] 执行工具 {tool_name}:")
-        else:
-            self.emit(f"\n> 执行工具 {tool_name}:")
+        role_hint = f"[{tag}] " if bracket_tag and tag else ""
+        self.emit(f"\n--- {role_hint}[本地执行] {tool_name} ---")
+        if tool_input is not None:
+            try:
+                inp = json.dumps(tool_input, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                inp = str(tool_input)
+            self.emit("  参数:")
+            for line in inp.splitlines() or [""]:
+                self.emit(f"    {line}")
+        self.emit("  输出（本地结果）:")
         out_s = str(output)
-        self.emit(out_s[:max_len] + ("…" if len(out_s) > max_len else ""))
+        if line_clip:
+            body = clip_text_by_lines(out_s, *line_clip)
+        else:
+            body = out_s[:max_len] + ("…" if len(out_s) > max_len else "")
+        for line in body.splitlines() or [""]:
+            self.emit(f"    {line}")
 
 
 # 默认实例：无角色色，供单 Agent 脚本使用

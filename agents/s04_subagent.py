@@ -51,7 +51,10 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from log import main_logger, sub_logger
+from log import clip_text_by_lines, main_logger, sub_logger
+
+# 日志：仅展示最新一条消息；长输出按行保留首尾各若干行
+S04_LOG_LINE_CLIP = (4, 4)
 
 load_dotenv(override=True)
 
@@ -174,13 +177,17 @@ def run_subagent(prompt: str, *, verbose: bool = True) -> str:
     response = None
     for sub_turn in range(1, 31):  # safety limit
         if verbose:
-            sub_logger.messages_context(sub_messages, "调用 API 前的消息历史")
+            sub_logger.messages_context(
+                sub_messages, "调用 API 前的消息历史", latest_only=True,
+            )
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
         )
         if verbose:
-            sub_logger.llm_response(sub_turn, response)
+            sub_logger.llm_response(
+                sub_turn, response, output_line_clip=S04_LOG_LINE_CLIP,
+            )
         sub_messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             break
@@ -189,10 +196,18 @@ def run_subagent(prompt: str, *, verbose: bool = True) -> str:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                sub_logger.tool_execution(block.name, output, bracket_tag=True)
+                sub_logger.tool_execution(
+                    block.name,
+                    output,
+                    tool_input=block.input,
+                    bracket_tag=True,
+                    line_clip=S04_LOG_LINE_CLIP,
+                )
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
         if verbose:
-            sub_logger.tool_results_summary(results)
+            sub_logger.tool_results_summary(
+                results, content_line_clip=S04_LOG_LINE_CLIP,
+            )
         sub_messages.append({"role": "user", "content": results})
     # Only the final text returns to the parent -- child context is discarded
     if response is None:
@@ -212,13 +227,17 @@ def agent_loop(messages: list, *, verbose: bool = True):
     while True:
         main_turn += 1
         if verbose:
-            main_logger.messages_context(messages, "调用 API 前的消息历史")
+            main_logger.messages_context(
+                messages, "调用 API 前的消息历史", latest_only=True,
+            )
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=PARENT_TOOLS, max_tokens=8000,
         )
         if verbose:
-            main_logger.llm_response(main_turn, response)
+            main_logger.llm_response(
+                main_turn, response, output_line_clip=S04_LOG_LINE_CLIP,
+            )
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             return
@@ -228,22 +247,32 @@ def agent_loop(messages: list, *, verbose: bool = True):
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
                     prompt = block.input.get("prompt", "")
+                    prompt_preview = clip_text_by_lines(
+                        prompt, *S04_LOG_LINE_CLIP,
+                    )
                     main_logger.emit(
-                        f"\n> [主 Agent] 委派 task ({desc}): {prompt[:500]}"
-                        + ("…" if len(prompt) > 500 else ""),
+                        f"\n> [主 Agent] 委派 task ({desc}):\n{prompt_preview}",
                     )
                     output = run_subagent(prompt, verbose=verbose)
                     main_logger.emit(
-                        f"\n[主 Agent] task 返回摘要（前 2000 字）:\n{str(output)[:2000]}"
-                        + ("…" if len(str(output)) > 2000 else ""),
+                        "\n[主 Agent] task 返回摘要（首尾若干行）:\n"
+                        + clip_text_by_lines(str(output), *S04_LOG_LINE_CLIP),
                     )
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                    main_logger.tool_execution(block.name, output, bracket_tag=True)
+                    main_logger.tool_execution(
+                        block.name,
+                        output,
+                        tool_input=block.input,
+                        bracket_tag=True,
+                        line_clip=S04_LOG_LINE_CLIP,
+                    )
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         if verbose:
-            main_logger.tool_results_summary(results)
+            main_logger.tool_results_summary(
+                results, content_line_clip=S04_LOG_LINE_CLIP,
+            )
         messages.append({"role": "user", "content": results})
 
 
