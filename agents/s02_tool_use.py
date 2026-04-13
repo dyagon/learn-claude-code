@@ -107,6 +107,17 @@ TOOLS = [
 ]
 
 
+def _content_block_to_dict(block) -> dict:
+    """API expects plain dicts; the SDK returns Pydantic content blocks on responses."""
+    if isinstance(block, dict):
+        return {k: v for k, v in block.items() if not k.startswith("_")}
+    model_dump = getattr(block, "model_dump", None)
+    if callable(model_dump):
+        d = model_dump(exclude_none=True)
+        return {k: v for k, v in d.items() if not k.startswith("_")}
+    raise TypeError(f"Unsupported message content block type: {type(block)!r}")
+
+
 def normalize_messages(messages: list) -> list:
     """Clean up messages before sending to the API.
 
@@ -121,12 +132,7 @@ def normalize_messages(messages: list) -> list:
         if isinstance(msg.get("content"), str):
             clean["content"] = msg["content"]
         elif isinstance(msg.get("content"), list):
-            clean["content"] = [
-                {k: v for k, v in block.items()
-                 if not k.startswith("_")}
-                for block in msg["content"]
-                if isinstance(block, dict)
-            ]
+            clean["content"] = [_content_block_to_dict(block) for block in msg["content"]]
         else:
             clean["content"] = msg.get("content", "")
         cleaned.append(clean)
